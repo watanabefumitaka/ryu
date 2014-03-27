@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import difflib
 import inspect
 import json
 import logging
@@ -642,8 +643,15 @@ class OfTester(app_manager.RyuApp):
             err_msg = 'OFPPacketIn[reason=%d]' % msg.reason
         elif repr(msg.data) != repr(model_pkt):
             pkt_type = 'packet'
-            err_msg = self._diff_packets(packet.Packet(model_pkt),
-                                         packet.Packet(msg.data))
+            expect, diff = Diff.diff(packet.Packet(model_pkt),
+                                     packet.Packet(msg.data))
+            if diff:
+                err_msg = diff
+            elif expect:
+                err_msg = 'expect packet=%s' % expect
+            else:
+                err_msg = ('Encounter an error during packet comparison.'
+                           ' it is malformed.')
         else:
             return TEST_OK
 
@@ -810,47 +818,6 @@ class OfTester(app_manager.RyuApp):
                     meter_stats.append('%s=%s' % (attr, getattr(stats1, attr)))
                 return False, 'meter_stats(%s)' % ','.join(meter_stats)
             return True, None
-
-    def _diff_packets(self, model_pkt, rcv_pkt):
-        msg = []
-        for rcv_p in rcv_pkt.protocols:
-            if type(rcv_p) != str:
-                model_protocols = model_pkt.get_protocols(type(rcv_p))
-                if len(model_protocols) == 1:
-                    model_p = model_protocols[0]
-                    diff = []
-                    for attr in rcv_p.__dict__:
-                        if attr.startswith('_'):
-                            continue
-                        if callable(attr):
-                            continue
-                        if hasattr(rcv_p.__class__, attr):
-                            continue
-                        rcv_attr = repr(getattr(rcv_p, attr))
-                        model_attr = repr(getattr(model_p, attr))
-                        if rcv_attr != model_attr:
-                            diff.append('%s=%s' % (attr, rcv_attr))
-                    if diff:
-                        msg.append('%s(%s)' %
-                                   (rcv_p.__class__.__name__,
-                                    ','.join(diff)))
-                else:
-                    if (not model_protocols or
-                            not str(rcv_p) in str(model_protocols)):
-                        msg.append(str(rcv_p))
-            else:
-                model_p = ''
-                for p in model_pkt.protocols:
-                    if type(p) == str:
-                        model_p = p
-                        break
-                if model_p != rcv_p:
-                    msg.append('str(%s)' % repr(rcv_p))
-        if msg:
-            return '/'.join(msg)
-        else:
-            return ('Encounter an error during packet comparison.'
-                    ' it is malformed.')
 
     def _test_get_throughput(self):
         xid = self.tester_sw.send_flow_stats()
@@ -1285,6 +1252,53 @@ class Test(stringify.StringifyMixin):
             tests.append(test_pkt)
 
         return (description, prerequisite, tests)
+
+
+class Diff(object):
+
+    _START_TAGS = ['(', '[', '{']
+    _END_TAGS = [')', ']', '}']
+
+    @classmethod
+    def diff(cls, ins1, ins2):
+        diffs = list(difflib.Differ().compare(cls._to_list_str(ins1),
+                                              cls._to_list_str(ins2)))
+        diff1 = [d for d in diffs if not d.startswith('+ ') and len(d) > 2]
+        diff2 = [d for d in diffs if not d.startswith('- ') and len(d) > 2]
+        return cls._format(diff1), cls._format(diff2)
+
+    @classmethod
+    def _to_list_str(cls, ins):
+        ins = repr(ins)
+        for tag in cls._START_TAGS:
+            ins = ins.replace(tag, '%s%s' % (tag, os.linesep))
+        for tag in cls._END_TAGS:
+            ins = ins.replace(tag, '%s%s' % (os.linesep, tag))
+        ins = ins.replace(',', os.linesep)
+        ins = ins.replace(' ', '')
+        return ins.splitlines()
+
+    @classmethod
+    def _format(cls, diffs):
+        tmp = [[]]
+        for diff in diffs:
+            if set(diff[-1]) & set(cls._START_TAGS):
+                tmp.append([diff])
+            elif set(diff[2]) & set(cls._END_TAGS):
+                tail = tmp.pop()
+                if tail[0].startswith('  ') and len(tail) == 1:
+                    continue
+                member = (','.join(tail[1:])
+                          if tail[0].startswith('  ') else '')
+                tail_str = '%s%s%s' % (tail[0][2:], member, diff[2:])
+                prev = tmp.pop()
+                prev.append(tail_str)
+                tmp.append(prev)
+            elif diff.startswith('+ ') or diff.startswith('- '):
+                tail = tmp.pop()
+                tail.append(diff[2:])
+                tmp.append(tail)
+        return ','.join(tmp[0])
 
 
 class DummyDatapath(object):
