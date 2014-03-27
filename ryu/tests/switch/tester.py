@@ -18,6 +18,7 @@ import inspect
 import json
 import logging
 import math
+import operator
 import os
 import signal
 import sys
@@ -384,13 +385,16 @@ class OfTester(app_manager.RyuApp):
             self._test(STATE_INIT_FLOW)
             self._test(STATE_INIT_FLOW_TESTER)
             # 1. Install flows.
+            flows = []
             for flow in test.prerequisite:
                 if isinstance(flow, ofproto_v1_3_parser.OFPFlowMod):
                     self._test(STATE_FLOW_INSTALL, self.target_sw, flow)
-                    self._test(STATE_FLOW_EXIST_CHK, self.target_sw, flow)
+                    flows.append(flow)
                 elif isinstance(flow, ofproto_v1_3_parser.OFPMeterMod):
                     self._test(STATE_METER_INSTALL, flow)
                     self._test(STATE_METER_EXIST_CHK, flow)
+            if flows:
+                self._test(STATE_FLOW_EXIST_CHK, self.target_sw, flows)
             # 2. Do tests.
             for pkt in test.tests:
 
@@ -401,13 +405,16 @@ class OfTester(app_manager.RyuApp):
                     tester_pkt_count = [self._test(STATE_TESTER_PKT_COUNT,
                                                    False)]
                 elif KEY_THROUGHPUT in pkt:
+                    flows = []
                     # install flows for throughput analysis
                     for throughput in pkt[KEY_THROUGHPUT]:
                         flow = throughput[KEY_FLOW]
                         self._test(STATE_FLOW_INSTALL_TESTER,
                                    self.tester_sw, flow)
+                        flows.append(flow)
+                    if flows:
                         self._test(STATE_FLOW_EXIST_CHK_TESTER,
-                                   self.tester_sw, flow)
+                                   self.tester_sw, flows)
                     start = self._test(STATE_GET_FLOW_STATS)
                 elif KEY_TBL_MISS in pkt:
                     before_stats = self._test(STATE_GET_MATCH_COUNT)
@@ -571,16 +578,20 @@ class OfTester(app_manager.RyuApp):
         self.send_msg_xids.append(xid)
         self._wait()
 
-        ng_stats = []
+        flow_stats = []
         for msg in self.rcv_msgs:
             assert isinstance(msg, ofproto_v1_3_parser.OFPFlowStatsReply)
-            for stats in msg.body:
-                result, stats = self._compare_flow(stats, flow_mod)
-                if result:
-                    return
-                else:
-                    ng_stats.append(stats)
-        raise TestFailure(self.state, flows=', '.join(ng_stats))
+            if datapath == self.target_sw:
+                flow_stats.extend(msg.body)
+            else:
+                for stats in msg.body:
+                    if stats.cookie == THROUGHPUT_COOKIE:
+                        flow_stats.append(stats)
+        expect, diff = self._compare_flow(flow_mod, flow_stats)
+        if expect or diff:
+            raise TestFailure(self.state,
+                              flows=(diff if diff
+                                     else 'expect flows=%s' % expect))
 
     def _test_meter_exist_check(self, meter_mod):
         xid = self.target_sw.send_meter_config_stats()
@@ -789,21 +800,32 @@ class OfTester(app_manager.RyuApp):
                 self.ingress_event.set()
                 break
 
-    def _compare_flow(self, stats1, stats2):
+    def _compare_stats(self, stats1, stats2,
+                       stats_type, compare_attrs, sort_attrs=None):
+        sort_attrs = sort_attrs or []
+
+        def _make_ofp_stats_list(stats):
+            stats_list = []
+            for stat in stats:
+                args = {}
+                for attr in compare_attrs:
+                    value = getattr(stat, attr)
+                    if attr in sort_attrs and value:
+                        value = sorted(value)
+                    args[attr] = value
+                stats_list.append(stats_type(**args))
+            stats_list.sort(key=operator.attrgetter(*compare_attrs))
+            return stats_list
+        return Diff.diff(_make_ofp_stats_list(stats1),
+                         _make_ofp_stats_list(stats2))
+
+    def _compare_flow(self, mod_list, stats_list):
         attr_list = ['cookie', 'priority', 'hard_timeout', 'idle_timeout',
                      'table_id', 'instructions', 'match']
-        for attr in attr_list:
-            value1 = getattr(stats1, attr)
-            value2 = getattr(stats2, attr)
-            if attr == 'instructions':
-                value1 = sorted(value1)
-                value2 = sorted(value2)
-            if str(value1) != str(value2):
-                flow_stats = []
-                for attr in attr_list:
-                    flow_stats.append('%s=%s' % (attr, getattr(stats1, attr)))
-                return False, 'flow_stats(%s)' % ','.join(flow_stats)
-        return True, None
+        sort_attrs = ['instructions']
+        return self._compare_stats(mod_list, stats_list,
+                                   ofproto_v1_3_parser.OFPFlowStats,
+                                   attr_list, sort_attrs)
 
     def _compare_meter(self, stats1, stats2):
         """compare the message used to install and the message got from
