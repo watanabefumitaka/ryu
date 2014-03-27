@@ -386,15 +386,18 @@ class OfTester(app_manager.RyuApp):
             self._test(STATE_INIT_FLOW_TESTER)
             # 1. Install flows.
             flows = []
+            meters = []
             for flow in test.prerequisite:
                 if isinstance(flow, ofproto_v1_3_parser.OFPFlowMod):
                     self._test(STATE_FLOW_INSTALL, self.target_sw, flow)
                     flows.append(flow)
                 elif isinstance(flow, ofproto_v1_3_parser.OFPMeterMod):
                     self._test(STATE_METER_INSTALL, flow)
-                    self._test(STATE_METER_EXIST_CHK, flow)
+                    meters.append(flow)
             if flows:
                 self._test(STATE_FLOW_EXIST_CHK, self.target_sw, flows)
+            if meters:
+                self._test(STATE_METER_EXIST_CHK, meters)
             # 2. Do tests.
             for pkt in test.tests:
 
@@ -598,17 +601,17 @@ class OfTester(app_manager.RyuApp):
         self.send_msg_xids.append(xid)
         self._wait()
 
-        ng_stats = []
+        meter_stats = []
         for msg in self.rcv_msgs:
             assert isinstance(
                 msg, ofproto_v1_3_parser.OFPMeterConfigStatsReply)
-            for stats in msg.body:
-                result, stats = self._compare_meter(stats, meter_mod)
-                if result:
-                    return
-                else:
-                    ng_stats.append(stats)
-        raise TestFailure(self.state, meters=', '.join(ng_stats))
+            meter_stats.extend(msg.body)
+
+        expect, diff = self._compare_meter(meter_mod, meter_stats)
+        if expect or diff:
+            raise TestFailure(self.state,
+                              meters=(diff if diff
+                                      else 'expect meters=%s' % expect))
 
     def _test_get_packet_count(self, is_target):
         sw = self.target_sw if is_target else self.tester_sw
@@ -827,19 +830,13 @@ class OfTester(app_manager.RyuApp):
                                    ofproto_v1_3_parser.OFPFlowStats,
                                    attr_list, sort_attrs)
 
-    def _compare_meter(self, stats1, stats2):
+    def _compare_meter(self, mod_list, stats_list):
         """compare the message used to install and the message got from
            the switch."""
         attr_list = ['flags', 'meter_id', 'bands']
-        for attr in attr_list:
-            value1 = getattr(stats1, attr)
-            value2 = getattr(stats2, attr)
-            if str(value1) != str(value2):
-                meter_stats = []
-                for attr in attr_list:
-                    meter_stats.append('%s=%s' % (attr, getattr(stats1, attr)))
-                return False, 'meter_stats(%s)' % ','.join(meter_stats)
-            return True, None
+        return self._compare_stats(mod_list, stats_list,
+                                   ofproto_v1_3_parser.OFPMeterConfigStats,
+                                   attr_list)
 
     def _test_get_throughput(self):
         xid = self.tester_sw.send_flow_stats()
